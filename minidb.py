@@ -61,6 +61,10 @@ import sys
 import json
 import datetime
 import logging
+import errno
+import fcntl
+import os
+import time
 
 
 logger = logging.getLogger(__name__)
@@ -126,11 +130,57 @@ class RowProxy(object):
         return self._keys
 
 
+class SimpleFlock:
+    """
+    Provides the simplest possible interface to flock-based file locking.
+    Intended for use with the `with` syntax. It will create/truncate/delete
+    the lock file as necessary.
+    Source: https://github.com/derpston/python-simpleflock
+    """
+
+    def __init__(self, path):
+        self._path = path
+        self._fd = None
+
+    def __enter__(self):
+        self._fd = os.open(self._path, os.O_CREAT)
+        while True:
+            try:
+                fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                # Lock acquired!
+                return
+            except (OSError, IOError) as ex:
+                if ex.errno != errno.EAGAIN:
+                    # Resource temporarily unavailable
+                    raise
+
+            # TODO It would be nice to avoid an arbitrary sleep here,
+            #      but spinning without a delay is also undesirable.
+            time.sleep(0.1)
+
+    def __exit__(self, *args):
+        fcntl.flock(self._fd, fcntl.LOCK_UN)
+        os.close(self._fd)
+        self._fd = None
+
+        # Try to remove the lock file, but don't try too hard because it is
+        # unnecessary. This is mostly to help the user see whether a lock
+        # exists by examining the filesystem.
+        try:
+            os.unlink(self._path)
+        except:
+            pass
+
+
 class Store(object):
     PRIMARY_KEY = ('id', int)
     MINIDB_ATTR = '_minidb'
 
     def __init__(self, filename=':memory:', debug=False, smartupdate=False):
+        self.file_lock = None
+        if filename != ':memory:':
+            self.file_lock = SimpleFlock(filename + '-lockfile')
+            self.file_lock.__enter__()
         self.db = sqlite3.connect(filename, check_same_thread=False)
         self.debug = debug
         self.smartupdate = smartupdate
@@ -169,6 +219,8 @@ class Store(object):
         with self.lock:
             self._execute('VACUUM')
             self.db.close()
+        if self.file_lock is not None:
+            self.file_lock.__exit__()
 
     def _ensure_schema(self, table, slots):
         with self.lock:
